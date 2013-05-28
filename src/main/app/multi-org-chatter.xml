@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:sfdc="http://www.mulesoft.org/schema/mule/sfdc" 
+xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns:script="http://www.mulesoft.org/schema/mule/scripting" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:spring="http://www.springframework.org/schema/beans" version="EE-3.4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:context="http://www.springframework.org/schema/context" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-current.xsd 
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd
+http://www.mulesoft.org/schema/mule/sfdc http://www.mulesoft.org/schema/mule/sfdc/current/mule-sfdc.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd ">
+	
+	<spring:beans>
+    	<context:property-placeholder location="classpath:app.properties" />
+  	</spring:beans>
+  
+	<!-- Salesforce Configurations -->
+	
+	<!-- Org1 -->
+	<sfdc:config name="org1" username="${sf.org1.username}" password="${sf.org1.password}" securityToken="${sf.org1.securityToken}" url="${sf.org1.endpoint}" >
+        <sfdc:connection-pooling-profile initialisationPolicy="INITIALISE_ONE" exhaustedAction="WHEN_EXHAUSTED_GROW"/>
+    </sfdc:config>
+    
+    <!-- Org2 -->
+	<sfdc:config name="org2" username="${sf.org2.username}" password="${sf.org2.password}" securityToken="${sf.org2.securityToken}" url="${sf.org2.endpoint}" >
+		<sfdc:connection-pooling-profile initialisationPolicy="INITIALISE_ONE" exhaustedAction="WHEN_EXHAUSTED_GROW"/>
+	</sfdc:config>
+
+	<!-- Create topics -->
+	<flow name="createExternalMessageTopic">
+        <http:inbound-endpoint exchange-pattern="request-response" host="0.0.0.0" path="createTopic" port="${http.port}" />
+        <sfdc:publish-topic config-ref="org1" topicName="NewExternalMessages" query="SELECT Id,Name,Body__c,ParentId__c FROM External_Message__c where Status__c = 'New'"/>
+    	<object-to-string-transformer doc:name="Object to String"/>	
+    </flow>
+	
+	<!-- Process new messages -->
+    <flow name="processNewMessagesFlow" doc:name="process new messages">
+    
+    	<!--  Subscribe to External Message topic -->
+		<sfdc:subscribe-topic config-ref="org1" topic="/NewExternalMessages"/>
+                          
+ 		<logger level="INFO" message="#[payload]"/>
+ 		
+
+		<!-- Add SF Id to message properties -->
+        <message-properties-transformer scope="session" doc:name="Message Properties">
+            <add-message-property key="SFRecordId" value="#[groovy:payload.get('Id')]"/>
+        </message-properties-transformer>
+
+		<!-- Update status to processing -->
+        <wire-tap>  
+            <vm:outbound-endpoint path="updateToProcessing" exchange-pattern="request-response"></vm:outbound-endpoint> 
+        </wire-tap>
+        
+        <!-- Broadcast message to other orgs -->
+        <vm:outbound-endpoint exchange-pattern="request-response" path="broadcastMessage" doc:name="VM"/>
+        
+ 		<object-to-string-transformer doc:name="Object to String"/>	
+ 		
+ 	</flow>
+
+	<!-- Update message status to Processing -->
+    <flow name="updateToProcessingFlow" doc:name="update to processing">
+    
+        <vm:inbound-endpoint exchange-pattern="request-response" path="updateToProcessing" doc:name="VM"/>
+        
+        <logger message="Updating record..." level="INFO" doc:name="Logger"/>
+        
+        <sfdc:update config-ref="org1" type="External_Message__c" doc:name="Salesforce">
+            <sfdc:objects>
+                <sfdc:object>
+                	<Id>#[header:session:SFRecordId]</Id>
+		        	<Status__c>Processing</Status__c>
+                </sfdc:object>
+            </sfdc:objects>
+        </sfdc:update>
+        
+        <logger message="#[payload:]" level="INFO" doc:name="Logger"/>
+        
+    </flow>
+    
+	<!-- Broadcast message -->
+    <flow name="broadcastMessageFlow" doc:name="Broadcast message">
+    
+        <vm:inbound-endpoint exchange-pattern="request-response" path="broadcastMessage" doc:name="VM"/>
+        
+        <set-variable variableName="sourceMessage" value="#[payload]"/>
+        
+        <logger message="Broadcasting message #[flowVars['sourceMessage'].get('Body__c')]" level="INFO" doc:name="Logger"/>
+
+		<sfdc:get-user-info config-ref="org2" />
+
+		<!-- Broadcast to Orgs -->
+        <sfdc:create config-ref="org2" type="FeedItem" doc:name="Update status to Sent">
+            <sfdc:objects>
+                <sfdc:object>
+		        	<Body>#[flowVars['sourceMessage'].get('Body__c')]</Body>
+		        	<Type>TextPost</Type>
+		        	<ParentId>#[groovy:payload.getUserId()]</ParentId>
+                </sfdc:object>
+            </sfdc:objects>
+        </sfdc:create>	
+        
+        <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+		
+		<!-- Update External message status -->
+        <sfdc:update config-ref="org1" type="External_Message__c" doc:name="Update status to Sent">
+            <sfdc:objects>
+                <sfdc:object>
+                	<Id>#[header:session:SFRecordId]</Id>
+		        	<Status__c>Sent</Status__c>
+                </sfdc:object>
+            </sfdc:objects>
+        </sfdc:update>
+
+    </flow>    
+    
+</mule>
